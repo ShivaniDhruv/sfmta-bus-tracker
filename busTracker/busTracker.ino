@@ -29,12 +29,7 @@ int getMinutesUntilArrival(const char* expectedArrival, const char* responseTime
 #include <WiFiNINA.h>
 #include <ArduinoHttpClient.h>
 #include <ArduinoJson.h>
-
-#define API_KEY "5ec99f17-0411-486a-80b5-396bd502168c"
-
-// -------- CONFIG --------
-const char WIFI_SSID[] = "^_^";
-const char WIFI_PASS[] = "johnharris";
+#include "secrets.h"
 
 // Name of the server we want to connect to
 const char kHostname[] = "api.511.org";
@@ -45,10 +40,11 @@ const int kNetworkTimeout = 30*1000;
 const int kNetworkDelay = 1000;
 
 // ------------------------
-WiFiClient wifi;
-HttpClient client = HttpClient(wifi, kHostname);
+WiFiSSLClient wifi;
+HttpClient client = HttpClient(wifi, kHostname, 443);
 
 void connectWiFi() {
+  Serial.println(WiFi.firmwareVersion());
   Serial.print("\nConnecting to WiFi");
   while (WiFi.begin(WIFI_SSID, WIFI_PASS) != WL_CONNECTED) {
     Serial.print(".");
@@ -120,9 +116,7 @@ void fetchBusData() {
 
   // Use ArduinoJson's streaming parser to avoid storing the full response
   StaticJsonDocument<2048> doc; // Adjust size as needed for a single visit
-  String filteredVisits = "[";
   String responseTimestamp = "";
-  bool firstVisit = true;
   bool foundTimestamp = false;
   int visitCount = 0;
   // Read the response stream character by character
@@ -130,6 +124,25 @@ void fetchBusData() {
   bool inVisits = false;
   bool accumulatingVisit = false;
   int visitBracketDepth = 0;
+
+  // For each allowed stop, store up to 3 shortest arrival times (in minutes)
+  const int MAX_ARRIVALS_PER_STOP = 3;
+  struct StopArrival {
+    const char* stopRef;
+    int arrivalMinutes[MAX_ARRIVALS_PER_STOP];
+    int count;
+  };
+  // For each allowed line, for each stop, keep a StopArrival
+  StopArrival stopArrivals[sizeof(allowedStops)/sizeof(allowedStops[0])][25];
+  // Initialize
+  for (int k = 0; k < allowedLines; k++) {
+    for (int j = 0; j < allowedStops[k].stopCount; j++) {
+      stopArrivals[k][j].stopRef = allowedStops[k].stopRefs[j];
+      for (int m = 0; m < MAX_ARRIVALS_PER_STOP; m++) stopArrivals[k][j].arrivalMinutes[m] = 9999;
+      stopArrivals[k][j].count = 0;
+    }
+  }
+
   while ((client.connected() || client.available()) && !client.endOfBodyReached() && ((millis() - timeoutStart) < kNetworkTimeout)) {
     if (client.available()) {
       char c = client.read();
@@ -170,34 +183,58 @@ void fetchBusData() {
             accumulatingVisit = true;
             visitBracketDepth = 1;
             buffer = buffer.substring(buffer.length() - 1);
-            Serial.println("Buffer at after first {: " + buffer);
-            Serial.println("Current char: " + String(cc));
-            Serial.println("Visit bracket depth: " + String(visitBracketDepth));
+            // Serial.println("Buffer at after first {: " + buffer);
+            // Serial.println("Current char: " + String(cc));
+            // Serial.println("Visit bracket depth: " + String(visitBracketDepth));
           }
         } else {
           if (cc == '{') visitBracketDepth++;
           if (cc == '}') visitBracketDepth--;
-          Serial.println("Buffer at after increment/decrement: " + buffer);
-          Serial.println("Current char: " + String(cc));
-          Serial.println("Visit bracket depth: " + String(visitBracketDepth));
+          // Serial.println("Buffer at after increment/decrement: " + buffer);
+          // Serial.println("Current char: " + String(cc));
+          // Serial.println("Visit bracket depth: " + String(visitBracketDepth));
           if (visitBracketDepth == 0) {
-            Serial.println("Completed visit object: " + buffer);
-            // Here you can process the visit object
+            // Serial.println("Completed visit object: " + buffer);
             accumulatingVisit = false;
-            // Example: deserialize and filter
+            // Deserialize and filter
             DeserializationError err = deserializeJson(doc, buffer);
             if (!err) {
               const char* lineRef = doc["MonitoredVehicleJourney"]["LineRef"];
               const char* stopPointRef = doc["MonitoredVehicleJourney"]["MonitoredCall"]["StopPointRef"];
-              for (int k = 0; k < allowedLines; k++) {
-                if (strcmp(lineRef, allowedStops[k].lineRef) == 0) {
-                  for (int j = 0; j < allowedStops[k].stopCount; j++) {
-                    if (strcmp(stopPointRef, allowedStops[k].stopRefs[j]) == 0) {
-                      if (!firstVisit) filteredVisits += ",";
-                      filteredVisits += buffer;
-                      firstVisit = false;
-                      visitCount++;
-                      Serial.println("Matched visit: Line " + String(lineRef) + " Stop " + String(stopPointRef));
+              const char* expectedArrival = doc["MonitoredVehicleJourney"]["MonitoredCall"]["ExpectedArrivalTime"];
+              // Only process if expectedArrival and responseTimestamp are available
+              if (lineRef && stopPointRef && expectedArrival && responseTimestamp.length() > 0) {
+                for (int k = 0; k < allowedLines; k++) {
+                  if (strcmp(lineRef, allowedStops[k].lineRef) == 0) {
+                    for (int j = 0; j < allowedStops[k].stopCount; j++) {
+                      if (strcmp(stopPointRef, allowedStops[k].stopRefs[j]) == 0) {
+                        int minutes = getMinutesUntilArrival(expectedArrival, responseTimestamp.c_str());
+                        // Insert minutes into sorted array for this stop (keep 3 shortest)
+                        StopArrival* sa = &stopArrivals[k][j];
+                        if (minutes >= 0) {
+                          // Insert in sorted order
+                          int pos = sa->count;
+                          if (pos < MAX_ARRIVALS_PER_STOP) {
+                            sa->arrivalMinutes[pos] = minutes;
+                            sa->count++;
+                          } else if (minutes < sa->arrivalMinutes[MAX_ARRIVALS_PER_STOP-1]) {
+                            sa->arrivalMinutes[MAX_ARRIVALS_PER_STOP-1] = minutes;
+                          }
+                          // Sort
+                          for (int m = 0; m < sa->count-1; m++) {
+                            for (int n = m+1; n < sa->count; n++) {
+                              if (sa->arrivalMinutes[m] > sa->arrivalMinutes[n]) {
+                                int tmp = sa->arrivalMinutes[m];
+                                sa->arrivalMinutes[m] = sa->arrivalMinutes[n];
+                                sa->arrivalMinutes[n] = tmp;
+                              }
+                            }
+                          }
+                          if (sa->count > MAX_ARRIVALS_PER_STOP) sa->count = MAX_ARRIVALS_PER_STOP;
+                        }
+                        visitCount++;
+                        // Serial.println("Matched visit: Line " + String(lineRef) + " Stop " + String(stopPointRef) + " Minutes: " + String(minutes));
+                      }
                     }
                   }
                 }
@@ -209,12 +246,25 @@ void fetchBusData() {
       }
     }
   }
-  filteredVisits += "]";
+
+  // Print results for debugging
   Serial.print("Filtered visits count: ");
   Serial.println(visitCount);
   Serial.print("ResponseTimestamp: ");
   Serial.println(responseTimestamp);
-  // Now filteredVisits contains only the visits you want, and responseTimestamp is separate
+  for (int k = 0; k < allowedLines; k++) {
+    Serial.print("Line "); Serial.print(allowedStops[k].lineRef); Serial.println(":");
+    for (int j = 0; j < allowedStops[k].stopCount; j++) {
+      StopArrival* sa = &stopArrivals[k][j];
+      Serial.print(sa->stopRef); Serial.print(": ");
+      for (int m = 0; m < sa->count; m++) {
+        Serial.print(sa->arrivalMinutes[m]);
+        if (m < sa->count-1) Serial.print(", ");
+      }
+      Serial.println();
+    }
+  }
+  // Now stopArrivals contains up to 3 shortest arrival times (in minutes) for each allowed stop
 }
 
 void setup() {
@@ -230,5 +280,5 @@ void setup() {
 void loop() {
   // put your main code here, to run repeatedly:
   fetchBusData();
-  delay(600000);  // refresh every 60 seconds
+  delay(60000);  // refresh every 60 seconds
 }
