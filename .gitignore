@@ -1,2 +1,12 @@
 # Secret credentials - never commit this
 busTracker/secrets.h
+
+# Node dependencies
+node_modules/
+
+# Wrangler local state and secrets
+worker/.wrangler/
+worker/.dev.vars
+
+# Sample/debug data files
+busTracker/*.json
