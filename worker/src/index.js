@@ -1,6 +1,5 @@
-// Cloudflare Worker: cron trigger fetches SFMTA bus data from 511.org,
-// parses arrival times, and stores compact results in KV.
-// HTTP handler reads from KV — nearly zero CPU time, no 503s.
+// Cloudflare Worker: fetches SFMTA bus data from 511.org on each request,
+// parses arrival times, and returns compact JSON.
 
 const ALLOWED_STOPS = {
   "24": new Set(["15147","14429","14330","14315","13521","14143","15882","15878","14624","14428","14331","14314","13520","14142","15881","15490"]),
@@ -13,10 +12,6 @@ const ALLOWED_STOPS = {
 };
 
 const MAX_ARRIVALS_PER_STOP = 3;
-const KV_KEY = "arrivals";
-
-// In-memory cache — updated by cron, read by fetch (same isolate)
-let cachedPayload = null;
 
 // Find closing brace matching the open brace at openPos, skipping JSON strings
 function findClosingBrace(text, openPos) {
@@ -40,19 +35,16 @@ function findClosingBrace(text, openPos) {
   return i - 1;
 }
 
-// Fetch from 511 API, parse, and store in KV
-async function refreshData(env) {
+async function fetchAndParse(env) {
   const apiUrl =
     `https://api.511.org/transit/StopMonitoring?api_key=${env.API_KEY}&agency=SF&format=json`;
 
-  const apiResponse = await fetch(apiUrl);
+  const apiResponse = await fetch(apiUrl, { cache: "no-store" });
   if (!apiResponse.ok) {
-    console.error(`511 API error: ${apiResponse.status}`);
-    return;
+    throw new Error(`511 API error: ${apiResponse.status}`);
   }
 
   let text = await apiResponse.text();
-  const cpuStart = Date.now();
   if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
 
   const tsMatch = text.match(/"ResponseTimestamp"\s*:\s*"([^"]+)"/);
@@ -62,14 +54,12 @@ async function refreshData(env) {
   const visitArrayKey = '"MonitoredStopVisit"';
   const arrayStart = text.indexOf(visitArrayKey);
   if (arrayStart === -1) {
-    console.error("No visits in 511 response");
-    return;
+    throw new Error("No visits in 511 response");
   }
 
   let pos = text.indexOf('[', arrayStart + visitArrayKey.length);
   if (pos === -1) {
-    console.error("Malformed visit array");
-    return;
+    throw new Error("Malformed visit array");
   }
 
   while (pos < text.length) {
@@ -94,7 +84,7 @@ async function refreshData(env) {
 
     const arrival =
       journey.MonitoredCall.ExpectedArrivalTime ||
-      journey.MonitoredCall.AimedArrivalTime;
+      (journey.VehicleRef ? journey.MonitoredCall.AimedArrivalTime : null);
     if (!arrival) continue;
 
     const minutes = Math.floor((new Date(arrival).getTime() - nowMs) / 60000);
@@ -115,15 +105,10 @@ async function refreshData(env) {
     }
   }
 
-  const cpuMs = Date.now() - cpuStart;
-  const payload = JSON.stringify({ data: result, cpuMs, updatedAt: Date.now() });
-  cachedPayload = payload;
-  await env.BUS_KV.put(KV_KEY, payload);
-  console.log(`Refreshed KV — cpuMs: ${cpuMs}, keys: ${Object.keys(result).length}`);
+  return result;
 }
 
 export default {
-  // HTTP handler: read pre-computed data from KV
   async fetch(request, env) {
     const authHeader = request.headers.get("Authorization") || "";
     const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
@@ -131,32 +116,14 @@ export default {
       return new Response("Unauthorized", { status: 401 });
     }
 
-    // Prefer in-memory cache (updated by cron), fall back to KV
-    let raw = cachedPayload;
-    if (!raw) {
-      raw = await env.BUS_KV.get(KV_KEY, { cacheTtl: 60 });
-    }
-    if (!raw) {
-      console.log("No cached data — doing live fetch to seed");
-      await refreshData(env);
-      raw = cachedPayload;
-    }
-    if (!raw) {
+    try {
+      const data = await fetchAndParse(env);
+      return new Response(JSON.stringify(data), {
+        headers: { "Content-Type": "application/json" },
+      });
+    } catch (err) {
+      console.error(err.message);
       return new Response("Failed to fetch data", { status: 503 });
     }
-
-    const { data, cpuMs, updatedAt } = JSON.parse(raw);
-    return new Response(JSON.stringify(data), {
-      headers: {
-        "Content-Type": "application/json",
-        "X-Cpu-Ms": String(cpuMs || 0),
-        "X-Updated-At": String(updatedAt || 0),
-      },
-    });
-  },
-
-  // Cron handler: fetch from 511, parse, store in KV
-  async scheduled(event, env, ctx) {
-    ctx.waitUntil(refreshData(env));
   },
 };

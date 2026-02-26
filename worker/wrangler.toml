@@ -2,9 +2,5 @@ name = "bus-tracker"
 main = "src/index.js"
 compatibility_date = "2026-02-25"
 
-[[kv_namespaces]]
-binding = "BUS_KV"
-id = "277832bdf70547f1ae31588e592139eb"
-
 [triggers]
 crons = ["* * * * *"]
