@@ -2,6 +2,9 @@ name = "bus-tracker"
 main = "src/index.js"
 compatibility_date = "2026-02-25"
 
-# Secrets (set via `npx wrangler secret put API_KEY` and `npx wrangler secret put AUTH_TOKEN`):
-# - API_KEY: '5ec99f17-0411-486a-80b5-396bd502168c'
-# - AUTH_TOKEN: a shared secret for Arduino auth
+[[kv_namespaces]]
+binding = "BUS_KV"
+id = "277832bdf70547f1ae31588e592139eb"
+
+[triggers]
+crons = ["* * * * *"]

@@ -6,6 +6,11 @@
 #include <ArduinoJson.h>
 #include "secrets.h"
 
+// Only print to Serial when USB is connected (prevents blocking on USB CDC boards)
+#define DBG_BEGIN(baud) Serial.begin(baud)
+#define DBG_PRINT(...) do { if (Serial) Serial.print(__VA_ARGS__); } while(0)
+#define DBG_PRINTLN(...) do { if (Serial) Serial.println(__VA_ARGS__); } while(0)
+
 // Forward declarations
 struct StopArrival;
 StopArrival* findArrival(const char* lineRef, const char* stopRef);
@@ -35,15 +40,17 @@ AllowedStop allowedStops[] = {
   {"67", {"17532", "17746", "14686", "17924", "14688", "14690", "13476", "17552", "14697", "13710", "14687", "14568"}, 12},
   {"J", {"17217", "16994", "16995", "16997", "16996", "18059", "16214", "18156", "16280", "14788", "15418", "16992", "15731", "15417", "15727", "15419", "14006", "16215", "18155", "16277", "14787", "17778"}, 21}
 };
-const int allowedLines = sizeof(allowedStops) / sizeof(allowedStops[0]);
+#define NUM_ALLOWED_LINES (sizeof(allowedStops) / sizeof(allowedStops[0]))
+#define MAX_STOPS_PER_LINE 25
+const int allowedLines = NUM_ALLOWED_LINES;
 
 const int MAX_ARRIVALS_PER_STOP = 3;
 struct StopArrival {
   const char* stopRef;
-  int arrivalMinutes[3];
+  int arrivalMinutes[MAX_ARRIVALS_PER_STOP];
   int count;
 };
-static StopArrival stopArrivals[7][25]; // [allowedLines][max stops per line]
+static StopArrival stopArrivals[NUM_ALLOWED_LINES][MAX_STOPS_PER_LINE];
 
 // --- LCD display page definitions ---
 struct DisplayPage {
@@ -55,13 +62,13 @@ struct DisplayPage {
   int walkMinutes;
 };
 DisplayPage displayPages[] = {
-  {"24",  "14143", "Bayvw", "14142", "PacHt", 10},
-  {"23",  "14200", "Bayvw", "14203", "SFZoo",  1},
-  {"49",  "15614", "CtyCl", "15613", "FtMsn", 10},
-  {"14",  "15614", "DlyCt", "15613", "Ferry", 10},
-  {"14R", "15614", "DlyCt", "15613", "Ferry", 10},
-  {"67",  "14690", "Bernl", "14568", "Missn",  5},
-  {"J",   "16280", "Balbo", "16277", "Ferry", 15},
+  {"24","14142", "PacHt", "14143", "Bayvw", 10},
+  {"23","14203", "SFZoo", "14200", "Bayvw", 1},
+  {"49","15613", "FtMsn", "15614", "CtyCl", 10},
+  {"14","15613", "Ferry", "15614", "DlyCt", 10},
+  {"14R","15613", "Ferry", "15614", "DlyCt", 10},
+  {"67","14568", "Missn", "14690", "Bernl",  5},
+  {"J","16277", "Ferry", "16280", "Balbo", 15},
 };
 const int NUM_DISPLAY_PAGES = sizeof(displayPages) / sizeof(displayPages[0]);
 
@@ -72,7 +79,10 @@ bool currentDirection = false; // false = direction 1, true = direction 2
 unsigned long lastDirectionSwap = 0;
 const unsigned long DIRECTION_INTERVAL = 5000; // 5 seconds
 unsigned long lastFetchTime = 0;
+unsigned long lastSuccessfulFetch = 0;
 const unsigned long FETCH_INTERVAL = 60UL * 1000; // 1 minute
+const unsigned long STALE_THRESHOLD = 3UL * 60 * 1000; // 3 minutes = stale
+
 
 // Find arrival data for a specific line + stop
 StopArrival* findArrival(const char* lineRef, const char* stopRef) {
@@ -93,10 +103,12 @@ void displayPage(int pageIndex, bool direction) {
   DisplayPage* p = &displayPages[pageIndex];
   char row[17];
 
-  // Row 1: line number + walk time
+  // Row 1: line number + walk time (* = stale data)
+  bool stale = (lastSuccessfulFetch == 0 && lastFetchTime > 0) ||
+               (lastSuccessfulFetch > 0 && (millis() - lastSuccessfulFetch > STALE_THRESHOLD));
   lcd.clear();
   lcd.setCursor(0, 0);
-  snprintf(row, 17, "%-3s %dm walk", p->lineRef, p->walkMinutes);
+  snprintf(row, 17, "%-3s %dm walk%s", p->lineRef, p->walkMinutes, stale ? " !" : "");
   lcd.print(row);
 
   // Row 2: direction label + arrival times
@@ -104,7 +116,7 @@ void displayPage(int pageIndex, bool direction) {
   const char* label   = direction ? p->label2   : p->label1;
   StopArrival* sa = findArrival(p->lineRef, stopRef);
 
-  char times[10] = "";
+  char times[12] = "";
   if (sa && sa->count > 0) {
     int pos = 0;
     for (int i = 0; i < sa->count && pos < 9; i++) {
@@ -121,148 +133,219 @@ void displayPage(int pageIndex, bool direction) {
   lcd.print(row);
 }
 
-void connectWiFi() {
-  Serial.print("\nConnecting to WiFi");
+// Connects/reconnects WiFi. Returns true if connected.
+bool ensureWiFi(const char* lcdMsg, unsigned long timeoutMs) {
+  if (WiFi.status() == WL_CONNECTED) return true;
+
+  DBG_PRINT("\n");
+  DBG_PRINT(lcdMsg);
+  lcd.clear();
+  lcd.print(lcdMsg);
+
+  WiFi.disconnect();
   WiFi.begin(WIFI_SSID, WIFI_PASS);
-  while (WiFi.status() != WL_CONNECTED) {
-    Serial.print(".");
-    delay(1500);
+  delay(500);
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < timeoutMs) {
+    DBG_PRINT(".");
+    delay(500);
   }
-  Serial.println("\nWiFi connected!");
+  if (WiFi.status() != WL_CONNECTED) {
+    DBG_PRINTLN("\nWiFi connect failed!");
+    lcd.clear();
+    lcd.print("WiFi failed!");
+    lcd.setCursor(0, 1);
+    lcd.print("Will retry...");
+    return false;
+  }
+  DBG_PRINTLN("\nWiFi connected!");
   wifi.setInsecure(); // skip SSL certificate verification
+  return true;
 }
 
-void fetchBusData() {
-  Serial.println("\nFetching bus data from worker...");
+// Returns elapsed ms on success, 0 on failure
+unsigned long fetchBusData() {
+  DBG_PRINTLN("\nFetching bus data from worker...");
   unsigned long fetchStart = millis();
 
-  String kPath = "/?token=" WORKER_AUTH_TOKEN;
+  if (!ensureWiFi("Reconnecting...", 15000)) {
+    return 0;
+  }
 
+  unsigned long result = 0; // 0 = failure
+
+  client.setHttpResponseTimeout(kNetworkTimeout);
   client.beginRequest();
-  int err = client.get(kPath);
+  int err = client.get("/");
+  client.sendHeader("Authorization", "Bearer " WORKER_AUTH_TOKEN);
   client.endRequest();
   if (err != 0) {
-    Serial.print("HTTP GET failed, error: ");
-    Serial.println(err);
-    return;
+    DBG_PRINT("HTTP GET failed, error: ");
+    DBG_PRINTLN(err);
+    goto cleanup;
   }
 
-  int statusCode = client.responseStatusCode();
-  if (statusCode != 200) {
-    String response = client.responseBody();
-    Serial.print("Status code: ");
-    Serial.println(statusCode);
-    Serial.print("Response: ");
-    Serial.println(response);
-    return;
-  }
-
-  String body = client.responseBody();
-  Serial.print("Response size: ");
-  Serial.println(body.length());
-
-  // Initialize stopArrivals
-  for (int k = 0; k < allowedLines; k++) {
-    for (int j = 0; j < allowedStops[k].stopCount; j++) {
-      stopArrivals[k][j].stopRef = allowedStops[k].stopRefs[j];
-      for (int m = 0; m < MAX_ARRIVALS_PER_STOP; m++) stopArrivals[k][j].arrivalMinutes[m] = 9999;
-      stopArrivals[k][j].count = 0;
+  {
+    int statusCode = client.responseStatusCode();
+    if (statusCode != 200) {
+      DBG_PRINT("Status code: ");
+      DBG_PRINTLN(statusCode);
+      goto cleanup;
     }
   }
 
-  // Parse the compact JSON: {"24":{"14143":[5,12],"14142":[3]},...}
-  JsonDocument doc;
-  DeserializationError parseErr = deserializeJson(doc, body);
-  if (parseErr) {
-    Serial.print("JSON parse error: ");
-    Serial.println(parseErr.c_str());
-    return;
-  }
+  {
+    DBG_PRINT("Content-Length: ");
+    DBG_PRINTLN(client.contentLength());
 
-  int visitCount = 0;
-  for (int k = 0; k < allowedLines; k++) {
-    const char* lineRef = allowedStops[k].lineRef;
-    JsonObject lineObj = doc[lineRef];
-    if (lineObj.isNull()) continue;
+    // Read body into buffer, then close connection to free SSL memory (~40KB)
+    // before allocating the JSON document — prevents peak memory crash
+    String body = client.responseBody();
+    client.stop();
 
-    for (int j = 0; j < allowedStops[k].stopCount; j++) {
-      const char* stopRef = allowedStops[k].stopRefs[j];
-      JsonArray arr = lineObj[stopRef];
-      if (arr.isNull()) continue;
+    DBG_PRINT("Body length: "); DBG_PRINTLN(body.length());
+    DBG_PRINT("Free heap: "); DBG_PRINTLN(ESP.getFreeHeap());
 
-      StopArrival* sa = &stopArrivals[k][j];
-      int count = 0;
-      for (JsonVariant v : arr) {
-        if (count >= MAX_ARRIVALS_PER_STOP) break;
-        sa->arrivalMinutes[count] = v.as<int>();
-        count++;
+    JsonDocument doc;
+    DeserializationError parseErr = deserializeJson(doc, body);
+    body = String(); // free body buffer now that doc owns the data
+    if (parseErr) {
+      DBG_PRINT("JSON parse error: ");
+      DBG_PRINTLN(parseErr.c_str());
+      goto cleanup; // previous good data in stopArrivals is preserved
+    }
+
+    // Parse succeeded — now safe to reinitialize stopArrivals
+    for (int k = 0; k < allowedLines; k++) {
+      for (int j = 0; j < allowedStops[k].stopCount; j++) {
+        stopArrivals[k][j].stopRef = allowedStops[k].stopRefs[j];
+        for (int m = 0; m < MAX_ARRIVALS_PER_STOP; m++) stopArrivals[k][j].arrivalMinutes[m] = 9999;
+        stopArrivals[k][j].count = 0;
       }
-      sa->count = count;
-      visitCount += count;
     }
-  }
 
-  unsigned long fetchElapsed = millis() - fetchStart;
-  Serial.print("Fetch time: ");
-  Serial.print(fetchElapsed / 1000);
-  Serial.print(".");
-  Serial.print((fetchElapsed % 1000) / 100);
-  Serial.println("s");
-  Serial.print("Arrival entries: ");
-  Serial.println(visitCount);
+    int visitCount = 0;
+    for (int k = 0; k < allowedLines; k++) {
+      const char* lineRef = allowedStops[k].lineRef;
+      JsonObject lineObj = doc[lineRef];
+      if (lineObj.isNull()) continue;
 
-  // Print results for debugging
-  for (int k = 0; k < allowedLines; k++) {
-    Serial.print("Line "); Serial.print(allowedStops[k].lineRef); Serial.println(":");
-    for (int j = 0; j < allowedStops[k].stopCount; j++) {
-      StopArrival* sa = &stopArrivals[k][j];
-      if (sa->count == 0) continue;
-      Serial.print(sa->stopRef); Serial.print(": ");
-      for (int m = 0; m < sa->count; m++) {
-        Serial.print(sa->arrivalMinutes[m]);
-        if (m < sa->count-1) Serial.print(", ");
+      for (int j = 0; j < allowedStops[k].stopCount; j++) {
+        const char* stopRef = allowedStops[k].stopRefs[j];
+        JsonArray arr = lineObj[stopRef];
+        if (arr.isNull()) continue;
+
+        StopArrival* sa = &stopArrivals[k][j];
+        int count = 0;
+        for (JsonVariant v : arr) {
+          if (count >= MAX_ARRIVALS_PER_STOP) break;
+          int mins = v.as<int>() - 1; // subtract 1 min: API times can be up to 1 min late
+          if (mins < 0) mins = 0;
+          if (mins > 999) mins = 999;
+          sa->arrivalMinutes[count] = mins;
+          count++;
+        }
+        sa->count = count;
+        visitCount += count;
       }
-      Serial.println();
     }
+
+    unsigned long fetchElapsed = millis() - fetchStart;
+    DBG_PRINT("Fetch time: ");
+    DBG_PRINT(fetchElapsed / 1000);
+    DBG_PRINT(".");
+    DBG_PRINT((fetchElapsed % 1000) / 100);
+    DBG_PRINTLN("s");
+    DBG_PRINT("Arrival entries: ");
+    DBG_PRINTLN(visitCount);
+    // Print results for debugging
+    for (int k = 0; k < allowedLines; k++) {
+      DBG_PRINT("Line "); DBG_PRINT(allowedStops[k].lineRef); DBG_PRINTLN(":");
+      for (int j = 0; j < allowedStops[k].stopCount; j++) {
+        StopArrival* sa = &stopArrivals[k][j];
+        if (sa->count == 0) continue;
+        DBG_PRINT(sa->stopRef); DBG_PRINT(": ");
+        for (int m = 0; m < sa->count; m++) {
+          DBG_PRINT(sa->arrivalMinutes[m]);
+          if (m < sa->count-1) DBG_PRINT(", ");
+        }
+        DBG_PRINTLN();
+      }
+    }
+
+    result = fetchElapsed;
   }
 
+cleanup:
   client.stop();
+  return result;
 }
 
 void setup() {
-  Serial.begin(9600);
-  while (!Serial) {
-    ; // wait for serial port to connect. Needed for native USB port only
-  }
+  DBG_BEGIN(9600);
+  delay(500); // brief settle time after boot
 
   // set up the LCD's number of rows and columns:
   if (!lcd.begin(16, 2)) {
-    Serial.println("Could not init backpack. Check wiring.");
-    while(1);
+    DBG_PRINTLN("Could not init backpack. Check wiring.");
+    delay(3000);
+    ESP.restart();
   }
-  Serial.println("Backpack init'd.");
+  DBG_PRINTLN("Backpack init'd.");
   lcd.setBacklight(HIGH);
+
+  // Custom character: down arrow (slot 0)
+  byte downArrow[8] = {
+    0b00100,
+    0b00100,
+    0b00100,
+    0b00100,
+    0b10101,
+    0b01110,
+    0b00100,
+    0b00000
+  };
+  lcd.createChar(0, downArrow);
+
+  // Show reset reason on LCD if abnormal (helps diagnose reboot loops)
+  esp_reset_reason_t reason = esp_reset_reason();
+  if (reason == ESP_RST_BROWNOUT || reason == ESP_RST_PANIC ||
+      reason == ESP_RST_INT_WDT || reason == ESP_RST_TASK_WDT || reason == ESP_RST_WDT) {
+    lcd.setCursor(0, 0);
+    switch (reason) {
+      case ESP_RST_BROWNOUT: lcd.print("RST: BROWNOUT"); break;
+      case ESP_RST_PANIC:    lcd.print("RST: PANIC");    break;
+      case ESP_RST_INT_WDT:  lcd.print("RST: INT_WDT");  break;
+      case ESP_RST_TASK_WDT: lcd.print("RST: TASK_WDT"); break;
+      default:               lcd.print("RST: WDT");      break;
+    }
+    lcd.setCursor(0, 1);
+    lcd.print("Heap:");
+    lcd.print(ESP.getFreeHeap());
+    delay(5000);
+    lcd.clear();
+  }
+
   lcd.print("Connecting...");
 
-  connectWiFi();
+  ensureWiFi("Connecting WiFi", 30000);
+  WiFi.setAutoReconnect(true);
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
   lcd.clear();
-  lcd.print("Waiting for data");
+  lcd.print("Waiting...");
 }
 
 void loop() {
   // Refresh data every FETCH_INTERVAL
   if (lastFetchTime == 0 || millis() - lastFetchTime >= FETCH_INTERVAL) {
-    unsigned long fetchStart = millis();
-    fetchBusData();
-    unsigned long fetchElapsed = millis() - fetchStart;
-    if (fetchElapsed > 60000) {
-      lcd.clear();
-      lcd.print("Fetch error:");
-      lcd.setCursor(0, 1);
-      lcd.print("took >1 min");
+    // Show update indicator — fetch blocks the loop so button/cycling won't respond
+    lcd.setCursor(15, 0);
+    lcd.write(byte(0)); // down arrow
+    unsigned long fetchElapsed = fetchBusData();
+    if (fetchElapsed > 0) {
+      lastSuccessfulFetch = millis();
     }
     lastFetchTime = millis();
     lastDirectionSwap = millis();
