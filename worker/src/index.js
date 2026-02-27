@@ -75,16 +75,16 @@ async function fetchAndParse(env) {
 
     const lineRef = lineMatch[1];
 
-    const visit = JSON.parse(visitText);
-    const journey = visit.MonitoredVehicleJourney;
-    if (!journey) continue;
+    const stopMatch = visitText.match(/"StopPointRef"\s*:\s*"([^"]+)"/);
+    if (!stopMatch || !ALLOWED_STOPS[lineRef].has(stopMatch[1])) continue;
+    const stopRef = stopMatch[1];
 
-    const stopRef = journey.MonitoredCall?.StopPointRef;
-    if (!stopRef || !ALLOWED_STOPS[lineRef].has(stopRef)) continue;
+    const expectedMatch = visitText.match(/"ExpectedArrivalTime"\s*:\s*"([^"]+)"/);
+    const aimedMatch = visitText.match(/"AimedArrivalTime"\s*:\s*"([^"]+)"/);
+    const vehicleMatch = visitText.match(/"VehicleRef"\s*:\s*"([^"]+)"/);
 
-    const arrival =
-      journey.MonitoredCall.ExpectedArrivalTime ||
-      (journey.VehicleRef ? journey.MonitoredCall.AimedArrivalTime : null);
+    const arrival = (expectedMatch && expectedMatch[1]) ||
+      (vehicleMatch ? (aimedMatch && aimedMatch[1]) : null);
     if (!arrival) continue;
 
     const minutes = Math.floor((new Date(arrival).getTime() - nowMs) / 60000);
@@ -109,6 +109,8 @@ async function fetchAndParse(env) {
 }
 
 export default {
+  async scheduled() {}, // no-op in case old cron trigger persists
+
   async fetch(request, env) {
     const authHeader = request.headers.get("Authorization") || "";
     const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
@@ -118,7 +120,9 @@ export default {
 
     try {
       const data = await fetchAndParse(env);
-      return new Response(JSON.stringify(data), {
+      const json = JSON.stringify(data);
+      console.log("Response JSON:", json);
+      return new Response(json, {
         headers: { "Content-Type": "application/json" },
       });
     } catch (err) {
