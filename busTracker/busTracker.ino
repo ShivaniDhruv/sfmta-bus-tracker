@@ -4,6 +4,7 @@
 #include "Adafruit_LiquidCrystal.h"
 #include <ArduinoHttpClient.h>
 #include <ArduinoJson.h>
+#include <Adafruit_Protomatter.h>
 #include "secrets.h"
 
 // Only print to Serial when USB is connected (prevents blocking on USB CDC boards)
@@ -25,20 +26,75 @@ HttpClient client = HttpClient(wifi, WORKER_HOST, 443);
 // Connect via i2c, default address #0 (A0-A2 not jumpered)
 Adafruit_LiquidCrystal lcd(0);
 
+// --- LED Matrix (Adafruit Protomatter) ---
+uint8_t rgbPins[]  = {42, 41, 40, 38, 39, 37};
+uint8_t addrPins[] = {45, 36, 48, 35, 21};
+uint8_t clockPin   = 2;
+uint8_t latchPin   = 47;
+uint8_t oePin      = 14;
+Adafruit_Protomatter matrix(
+  32, 4, 1, rgbPins, 3, addrPins, clockPin, latchPin, oePin, false);
+
 // --- Global data structures for bus arrivals ---
+struct StopDef {
+  const char* ref;
+  int8_t ledRow; // -1 = no LED
+  int8_t ledCol;
+};
 struct AllowedStop {
   const char* lineRef;
-  const char* stopRefs[25];
+  StopDef stops[25];
   int stopCount;
 };
 AllowedStop allowedStops[] = {
-  {"24", {"15147", "14429", "14330", "14315", "13521", "14143", "15882", "15878", "14624", "14428", "14331", "14314", "13520", "14142", "15881", "15490"}, 16},
-  {"23", {"17208", "16436", "14386", "14192", "14200", "15882", "15864", "15865", "16453", "16435", "14387", "14198", "14203", "15881", "15863", "15776"}, 16},
-  {"49", {"16819", "18102", "18104", "15836", "15552", "15566", "15572", "15614", "15782", "17804", "15926", "16820", "18091", "18089", "15546", "15551", "15565", "15571", "15613", "15783", "15781", "15791"}, 22},
-  {"14", {"16498", "15529", "15536", "15543", "15836", "15552", "15566", "15572", "15614", "15592", "15588", "15693", "15530", "15535", "15542", "17299", "15551", "15565", "15571", "15613", "15593", "17099"}, 22},
-  {"14R", {"16498", "15529", "15536", "15552", "15566", "15572", "15614", "15592", "15588", "15693", "15530", "15535", "15551", "15565", "15571", "15613", "15593"}, 17},
-  {"67", {"17532", "17746", "14686", "17924", "14688", "14690", "13476", "17552", "14697", "13710", "14687", "14568"}, 12},
-  {"J", {"17217", "16994", "16995", "16997", "16996", "18059", "16214", "18156", "16280", "14788", "15418", "16992", "15731", "15417", "15727", "15419", "14006", "16215", "18155", "16277", "14787", "17778"}, 21}
+  {"24", {
+    {"15147",8,6}, {"14429",7,3}, {"14330",7,5}, {"14315",7,7},
+    {"13521",6,7}, {"14143",10,2}, {"15882",12,3}, {"15878",13,5},
+    {"14624",8,7}, {"14428",7,2}, {"14331",7,4}, {"14314",7,6},
+    {"13520",6,6}, {"14142",11,2}, {"15881",12,2}, {"15490",13,4}
+  }, 16},
+  {"23", {
+    {"17208",3,3}, {"16436",3,1}, {"14386",5,5}, {"14192",7,1},
+    {"14200",9,3}, {"15882",12,5}, {"15864",13,7}, {"15865",12,1},
+    {"16453",3,2}, {"16435",3,0}, {"14387",5,4}, {"14198",7,0},
+    {"14203",9,2}, {"15881",12,4}, {"15863",13,6}, {"15776",12,0}
+  }, 16},
+  {"49", {
+    {"16819",1,12}, {"18102",15,9}, {"18104",15,12}, {"15836",14,9},
+    {"15552",11,8}, {"15566",10,8}, {"15572",9,7}, {"15614",8,5},
+    {"15782",4,0}, {"17804",5,6}, {"15926",4,6}, {"16820",1,11},
+    {"18091",15,8}, {"18089",15,11}, {"15546",14,8}, {"15551",11,7},
+    {"15565",10,7}, {"15571",9,6}, {"15613",8,4}, {"15783",4,1},
+    {"15781",5,7}, {"15791",4,7}
+  }, 22},
+  {"14", {
+    {"16498",15,2}, {"15529",15,6}, {"15536",14,1}, {"15543",14,5},
+    {"15836",13,1}, {"15552",11,6}, {"15566",10,6}, {"15572",9,5},
+    {"15614",8,3}, {"15592",4,2}, {"15588",3,4}, {"15693",15,3},
+    {"15530",15,7}, {"15535",14,0}, {"15542",14,4}, {"17299",13,0},
+    {"15551",11,5}, {"15565",10,5}, {"15571",9,4}, {"15613",8,2},
+    {"15593",4,3}, {"17099",3,5}
+  }, 22},
+  {"14R", {
+    {"16498",15,2}, {"15529",15,6}, {"15536",14,1}, {"15552",11,6},
+    {"15566",10,6}, {"15572",9,5}, {"15614",8,3}, {"15592",4,2},
+    {"15588",3,4}, {"15693",15,3}, {"15530",15,7}, {"15535",14,0},
+    {"15551",11,5}, {"15565",10,5}, {"15571",9,4}, {"15613",8,2},
+    {"15593",4,3}
+  }, 17},
+  {"67", {
+    {"17532",8,1}, {"17746",11,1}, {"14686",10,1}, {"17924",11,3},
+    {"14688",9,1}, {"14690",10,3}, {"13476",8,0}, {"17552",11,0},
+    {"14697",10,0}, {"13710",11,4}, {"14687",9,0}, {"14568",10,4}
+  }, 12},
+  {"J", {
+    {"17217",15,0}, {"16994",15,4}, {"16995",14,3}, {"16997",14,7},
+    {"16996",13,3}, {"18059",6,1}, {"16214",6,3}, {"18156",6,5},
+    {"16280",5,1}, {"14788",5,2}, {"15418",4,4}, {"16992",15,1},
+    {"15731",15,5}, {"15417",14,2}, {"15727",14,6}, {"15419",13,2},
+    {"14006",6,0}, {"16215",6,2}, {"18155",6,4}, {"16277",5,0},
+    {"14787",5,3}, {"17778",4,5}
+  }, 22}
 };
 #define NUM_ALLOWED_LINES (sizeof(allowedStops) / sizeof(allowedStops[0]))
 #define MAX_STOPS_PER_LINE 25
@@ -51,6 +107,39 @@ struct StopArrival {
   int count;
 };
 static StopArrival stopArrivals[NUM_ALLOWED_LINES][MAX_STOPS_PER_LINE];
+
+#define LED_ARRIVAL_THRESHOLD 2
+
+// Get RGB color for a bus line
+void getLineColor(const char* lineRef, uint8_t &r, uint8_t &g, uint8_t &b) {
+  if      (strcmp(lineRef, "49") == 0)  { r=0;   g=255; b=0;   } // green
+  else if (strcmp(lineRef, "14") == 0)  { r=255; g=0;   b=0;   } // red
+  else if (strcmp(lineRef, "14R") == 0) { r=255; g=0;   b=0;   } // red (same as 14)
+  else if (strcmp(lineRef, "67") == 0)  { r=0;   g=0;   b=255; } // blue
+  else if (strcmp(lineRef, "J") == 0)   { r=255; g=110; b=0;   } // orange
+  else if (strcmp(lineRef, "23") == 0)  { r=255; g=255; b=0;   } // yellow
+  else if (strcmp(lineRef, "24") == 0)  { r=255; g=0;   b=255; } // magenta
+  else                                  { r=255; g=255; b=255; }
+}
+
+// Update LED matrix: light stops with a bus arriving within threshold
+void updateLEDs() {
+  matrix.fillScreen(0);
+  for (int k = 0; k < allowedLines; k++) {
+    for (int j = 0; j < allowedStops[k].stopCount; j++) {
+      StopArrival* sa = &stopArrivals[k][j];
+      int8_t row = allowedStops[k].stops[j].ledRow;
+      int8_t col = allowedStops[k].stops[j].ledCol;
+      if (row < 0) continue;
+      if (sa->count > 0 && sa->arrivalMinutes[0] <= LED_ARRIVAL_THRESHOLD) {
+        uint8_t r, g, b;
+        getLineColor(allowedStops[k].lineRef, r, g, b);
+        matrix.drawPixel(col, row, matrix.color565(r, g, b));
+      }
+    }
+  }
+  matrix.show();
+}
 
 // --- LCD display page definitions ---
 struct DisplayPage {
@@ -218,7 +307,7 @@ unsigned long fetchBusData() {
     // Parse succeeded — now safe to reinitialize stopArrivals
     for (int k = 0; k < allowedLines; k++) {
       for (int j = 0; j < allowedStops[k].stopCount; j++) {
-        stopArrivals[k][j].stopRef = allowedStops[k].stopRefs[j];
+        stopArrivals[k][j].stopRef = allowedStops[k].stops[j].ref;
         for (int m = 0; m < MAX_ARRIVALS_PER_STOP; m++) stopArrivals[k][j].arrivalMinutes[m] = 9999;
         stopArrivals[k][j].count = 0;
       }
@@ -231,7 +320,7 @@ unsigned long fetchBusData() {
       if (lineObj.isNull()) continue;
 
       for (int j = 0; j < allowedStops[k].stopCount; j++) {
-        const char* stopRef = allowedStops[k].stopRefs[j];
+        const char* stopRef = allowedStops[k].stops[j].ref;
         JsonArray arr = lineObj[stopRef];
         if (arr.isNull()) continue;
 
@@ -294,6 +383,14 @@ void setup() {
   DBG_PRINTLN("Backpack init'd.");
   lcd.setBacklight(HIGH);
 
+  // Initialize LED matrix
+  ProtomatterStatus matStatus = matrix.begin();
+  if (matStatus != PROTOMATTER_OK) {
+    DBG_PRINT("Protomatter error: "); DBG_PRINTLN((int)matStatus);
+  }
+  matrix.fillScreen(0);
+  matrix.show();
+
   // Custom character: down arrow (slot 0)
   byte downArrow[8] = {
     0b00100,
@@ -351,6 +448,7 @@ void loop() {
     lastDirectionSwap = millis();
     currentDirection = false;
     displayPage(currentPage, currentDirection);
+    updateLEDs();
   }
 
   // Alternate direction every 5 seconds
