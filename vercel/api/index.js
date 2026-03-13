@@ -1,0 +1,127 @@
+// Vercel Serverless Function: fetches SFMTA bus data from 511.org,
+// parses arrival times, and returns compact JSON.
+
+const ALLOWED_STOPS = {
+  "24": new Set(["15147","14429","14330","14315","13521","14143","15882","15878","14624","14428","14331","14314","13520","14142","15881","15490"]),
+  "23": new Set(["17208","16436","14386","14192","14200","15882","15864","15865","16453","16435","14387","14198","14203","15881","15863","15776"]),
+  "49": new Set(["16819","18102","18104","15836","15552","15566","15572","15614","15782","17804","15926","16820","18091","18089","15546","15551","15565","15571","15613","15783","15781","15791"]),
+  "14": new Set(["16498","15529","15536","15543","15836","15552","15566","15572","15614","15592","15588","15693","15530","15535","15542","17299","15551","15565","15571","15613","15593","17099"]),
+  "14R": new Set(["16498","15529","15536","15552","15566","15572","15614","15592","15588","15693","15530","15535","15551","15565","15571","15613","15593"]),
+  "67": new Set(["17532","17746","14686","17924","14688","14690","13476","17552","14697","13710","14687","14568"]),
+  "J": new Set(["17217","16994","16995","16997","16996","18059","16214","18156","16280","14788","15418","16992","15731","15417","15727","15419","14006","16215","18155","16277","14787","17778"]),
+};
+
+const MAX_ARRIVALS_PER_STOP = 3;
+
+function findClosingBrace(text, openPos) {
+  let depth = 1;
+  let i = openPos + 1;
+  const len = text.length;
+  while (i < len && depth > 0) {
+    const ch = text.charCodeAt(i);
+    if (ch === 123) depth++;
+    else if (ch === 125) depth--;
+    else if (ch === 34) {
+      i++;
+      while (i < len) {
+        if (text.charCodeAt(i) === 92) i++;
+        else if (text.charCodeAt(i) === 34) break;
+        i++;
+      }
+    }
+    i++;
+  }
+  return i - 1;
+}
+
+async function fetchAndParse() {
+  const apiUrl =
+    `https://api.511.org/transit/StopMonitoring?api_key=${process.env.API_KEY}&agency=SF&format=json`;
+
+  const apiResponse = await fetch(apiUrl, { cache: "no-store" });
+  if (!apiResponse.ok) {
+    throw new Error(`511 API error: ${apiResponse.status}`);
+  }
+
+  let text = await apiResponse.text();
+  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+
+  const tsMatch = text.match(/"ResponseTimestamp"\s*:\s*"([^"]+)"/);
+  const nowMs = tsMatch ? new Date(tsMatch[1]).getTime() : Date.now();
+
+  const result = {};
+  const visitArrayKey = '"MonitoredStopVisit"';
+  const arrayStart = text.indexOf(visitArrayKey);
+  if (arrayStart === -1) {
+    throw new Error("No visits in 511 response");
+  }
+
+  let pos = text.indexOf('[', arrayStart + visitArrayKey.length);
+  if (pos === -1) {
+    throw new Error("Malformed visit array");
+  }
+
+  while (pos < text.length) {
+    const objStart = text.indexOf('{', pos);
+    if (objStart === -1) break;
+
+    const objEnd = findClosingBrace(text, objStart);
+    const visitText = text.substring(objStart, objEnd + 1);
+    pos = objEnd + 1;
+
+    const lineMatch = visitText.match(/"LineRef"\s*:\s*"([^"]+)"/);
+    if (!lineMatch || !ALLOWED_STOPS[lineMatch[1]]) continue;
+
+    const lineRef = lineMatch[1];
+
+    const stopMatch = visitText.match(/"StopPointRef"\s*:\s*"([^"]+)"/);
+    if (!stopMatch || !ALLOWED_STOPS[lineRef].has(stopMatch[1])) continue;
+    const stopRef = stopMatch[1];
+
+    const expectedMatch = visitText.match(/"ExpectedArrivalTime"\s*:\s*"([^"]+)"/);
+    const aimedMatch = visitText.match(/"AimedArrivalTime"\s*:\s*"([^"]+)"/);
+    const vehicleMatch = visitText.match(/"VehicleRef"\s*:\s*"([^"]+)"/);
+
+    const arrival = (expectedMatch && expectedMatch[1]) ||
+      (vehicleMatch ? (aimedMatch && aimedMatch[1]) : null);
+    if (!arrival) continue;
+
+    const minutes = Math.floor((new Date(arrival).getTime() - nowMs) / 60000);
+    if (minutes < 0) continue;
+
+    if (!result[lineRef]) result[lineRef] = {};
+    if (!result[lineRef][stopRef]) result[lineRef][stopRef] = [];
+    result[lineRef][stopRef].push(minutes);
+  }
+
+  for (const line in result) {
+    for (const stop in result[line]) {
+      const arr = result[line][stop];
+      arr.sort((a, b) => a - b);
+      if (arr.length > MAX_ARRIVALS_PER_STOP) {
+        result[line][stop] = arr.slice(0, MAX_ARRIVALS_PER_STOP);
+      }
+    }
+  }
+
+  return result;
+}
+
+export default async function handler(req, res) {
+  const authHeader = req.headers["authorization"] || "";
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+  if (token !== process.env.AUTH_TOKEN) {
+    return res.status(401).send("Unauthorized");
+  }
+
+  try {
+    const start = Date.now();
+    const data = await fetchAndParse();
+    console.log(`Duration: ${Date.now() - start}ms`);
+    console.log("Response JSON:", JSON.stringify(data));
+    return res.status(200).json(data);
+  } catch (err) {
+    console.error(err.message);
+    return res.status(503).send("Failed to fetch data");
+  }
+}

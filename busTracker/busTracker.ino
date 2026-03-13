@@ -169,7 +169,7 @@ unsigned long lastDirectionSwap = 0;
 const unsigned long DIRECTION_INTERVAL = 5000; // 5 seconds
 unsigned long lastFetchTime = 0;
 unsigned long lastSuccessfulFetch = 0;
-const unsigned long FETCH_INTERVAL = 60UL * 1000; // 1 minute
+const unsigned long FETCH_INTERVAL = 90UL * 1000; // 90 seconds
 const unsigned long STALE_THRESHOLD = 3UL * 60 * 1000; // 3 minutes = stale
 
 
@@ -265,7 +265,7 @@ unsigned long fetchBusData() {
 
   client.setHttpResponseTimeout(kNetworkTimeout);
   client.beginRequest();
-  int err = client.get("/");
+  int err = client.get("/api");
   client.sendHeader("Authorization", "Bearer " WORKER_AUTH_TOKEN);
   client.endRequest();
   if (err != 0) {
@@ -458,17 +458,68 @@ void loop() {
     displayPage(currentPage, currentDirection);
   }
 
-  // Check button for page cycling (active LOW with pull-up)
+  // Button handling: single click = cycle page, double click = instant fetch, hold = reset
   static bool lastButtonState = HIGH;
-  static unsigned long lastDebounceTime = 0;
+  static unsigned long pressStartTime = 0;
+  static unsigned long lastClickTime = 0;
+  static int clickCount = 0;
+  static bool holdHandled = false;
+  const unsigned long DEBOUNCE_MS = 50;
+  const unsigned long DOUBLE_CLICK_MS = 400;
+  const unsigned long HOLD_MS = 1500;
+
   bool buttonState = digitalRead(BUTTON_PIN);
-  if (buttonState == LOW && lastButtonState == HIGH && (millis() - lastDebounceTime) > 200) {
-    currentPage = (currentPage + 1) % NUM_DISPLAY_PAGES;
-    currentDirection = false;
-    lastDirectionSwap = millis();
-    displayPage(currentPage, currentDirection);
-    lastDebounceTime = millis();
+
+  // Button just pressed
+  if (buttonState == LOW && lastButtonState == HIGH) {
+    pressStartTime = millis();
+    holdHandled = false;
   }
+
+  // Button held down — check for long press
+  if (buttonState == LOW && !holdHandled && (millis() - pressStartTime >= HOLD_MS)) {
+    holdHandled = true;
+    clickCount = 0;
+    lcd.clear();
+    lcd.print("Resetting...");
+    delay(500);
+    ESP.restart();
+  }
+
+  // Button just released (and not a hold)
+  if (buttonState == HIGH && lastButtonState == LOW && !holdHandled) {
+    if (millis() - pressStartTime >= DEBOUNCE_MS) {
+      clickCount++;
+      lastClickTime = millis();
+    }
+  }
+
+  // Process clicks after double-click window expires
+  if (clickCount > 0 && (millis() - lastClickTime >= DOUBLE_CLICK_MS)) {
+    if (clickCount >= 2) {
+      // Double click: instant fetch
+      clickCount = 0;
+      lcd.setCursor(15, 0);
+      lcd.write(byte(0)); // down arrow
+      unsigned long fetchElapsed = fetchBusData();
+      if (fetchElapsed > 0) {
+        lastSuccessfulFetch = millis();
+      }
+      lastFetchTime = millis();
+      lastDirectionSwap = millis();
+      currentDirection = false;
+      displayPage(currentPage, currentDirection);
+      updateLEDs();
+    } else {
+      // Single click: cycle page
+      clickCount = 0;
+      currentPage = (currentPage + 1) % NUM_DISPLAY_PAGES;
+      currentDirection = false;
+      lastDirectionSwap = millis();
+      displayPage(currentPage, currentDirection);
+    }
+  }
+
   lastButtonState = buttonState;
 
   delay(5);
